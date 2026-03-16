@@ -210,6 +210,7 @@ class Parser(object):
 
     @parse_debug
     def parse_identifier(self):
+        self.try_accept('oneway')
         return self.accept(Identifier)
 
     @parse_debug
@@ -343,6 +344,8 @@ class Parser(object):
             type_declaration = self.parse_annotation_type_declaration()
         elif token.value == "parcelable":
             type_declaration = self.parse_parcelable_type_declaration()
+        elif token.value == "oneway":
+            type_declaration = self.parse_normal_interface_declaration()
         else:
             self.illegal(f"Expected type declaration - got {self.tokens.value}")
 
@@ -407,6 +410,7 @@ class Parser(object):
         extends = None
         body = None
 
+        self.try_accept('oneway')
         self.accept('interface')
         name = self.parse_identifier()
 
@@ -507,8 +511,7 @@ class Parser(object):
 
         if self.would_accept(BasicType):
             base_type = self.parse_basic_type()
-            self.accept('[', ']')
-            base_type.dimensions = [None]
+            base_type.dimensions = []
         else:
             base_type = self.parse_reference_type()
             base_type.dimensions = []
@@ -608,32 +611,109 @@ class Parser(object):
 # ------------------------------------------------------------------------------
 # -- Parcelable --
 
-    @parse_debug
-    def parse_parcelable_type_declaration(self) -> None:
+    def parse_parcelable_body(self):
+        declarations = []
+        self.accept('{')
+
+        while not self.would_accept('}'):
+            if self.try_accept(';'):
+                continue
+
+            modifiers, annotations, javadoc = self.parse_modifiers()
+            token = self.tokens.look()
+
+            if self.would_accept('enum'):
+                declaration = self.parse_enum_declaration()
+            elif self.would_accept('parcelable'):
+                declaration = self.parse_parcelable_type_declaration()
+            elif self.would_accept('interface'):
+                declaration = self.parse_normal_interface_declaration()
+            elif self.would_accept('class'):
+                declaration = self.parse_normal_class_declaration()
+            elif self.is_annotation_declaration():
+                declaration = self.parse_annotation_type_declaration()
+            elif self.try_accept('const'):
+                declaration = self.parse_aidl_const_declaration()
+            else:
+                declaration = self.parse_parcelable_field_declaration()
+
+            declaration._position = token.position
+            declaration.modifiers = modifiers
+            declaration.annotations = annotations
+            declaration.documentation = javadoc
+
+            declarations.append(declaration)
+
+        self.accept('}')
+        return declarations
+
+    def parse_parcelable_field_declaration(self):
+        field_type = self.parse_type()
+        field_name = self.parse_identifier()
+        dims = self.parse_array_dimension()
+        initializer = None
+
+        if self.try_accept('='):
+            initializer = self.parse_variable_initializer()
+
+        self.accept(';')
+
+        field = tree.FieldDeclaration(
+            declarators=[
+                tree.VariableDeclarator(
+                    name=field_name,
+                    dimensions=dims,
+                    initializer=initializer,
+                )
+            ]
+        )
+        field.type = field_type
+        return field
+
+    def parse_parcelable_type_declaration(self):
         self.accept("parcelable")
 
         name = self.parse_identifier()
         is_ref = False
-        header = None
         body = None
 
-        if self.would_accept("cpp_header"):
-            self.accept("cpp_header")
-            header = self.tokens.next().value.strip('"')
+        cpp_header = None
+        ndk_header = None
+        rust_type = None
 
         if self.would_accept("."):
-            # Inner Parcelable decraration
             self.accept(".")
             name = "$".join([name, self.tokens.next().value])
 
+        # Parse zero or more backend metadata clauses
+        while True:
+            if self.try_accept("cpp_header"):
+                cpp_header = self.tokens.next().value.strip('"')
+            elif self.try_accept("ndk_header"):
+                ndk_header = self.tokens.next().value.strip('"')
+            elif self.try_accept("rust_type"):
+                rust_type = self.tokens.next().value.strip('"')
+            else:
+                break
+
         if self.try_accept(";"):
             is_ref = True
+        else:
+            body = self.parse_parcelable_body()
 
-        if not is_ref:
-            body = self.parse_interface_body()
+        decl = tree.ParcelableDeclaration(
+            name=name,
+            body=body,
+            is_ref=is_ref,
+            cpp_header=cpp_header,
+        )
 
-        return tree.ParcelableDeclaration(name=name, body=body, is_ref=is_ref, cpp_header=header)
+        # Attach newer AIDL metadata if your AST supports it
+        if hasattr(decl, "__dict__"):
+            decl.ndk_header = ndk_header
+            decl.rust_type = rust_type
 
+        return decl
 # ------------------------------------------------------------------------------
 # -- Annotations and modifiers --
 
@@ -996,7 +1076,7 @@ class Parser(object):
     @parse_debug
     def parse_interface_member_declaration(self):
         declaration = None
-
+        self.try_accept('oneway')
         token = self.tokens.look()
         if self.would_accept('class'):
             declaration = self.parse_normal_class_declaration()
@@ -1004,6 +1084,8 @@ class Parser(object):
             declaration = self.parse_normal_interface_declaration()
         elif self.would_accept('enum'):
             declaration = self.parse_enum_declaration()
+        elif self.would_accept('parcelable'):
+            declaration = self.parse_parcelable_type_declaration()
         elif self.is_annotation_declaration():
             declaration = self.parse_annotation_type_declaration()
         elif self.would_accept('<'):
@@ -1012,12 +1094,48 @@ class Parser(object):
             method_name = self.parse_identifier()
             declaration = self.parse_void_interface_method_declarator_rest()
             declaration.name = method_name
+        elif self.try_accept('const'):
+            declaration = self.parse_aidl_const_declaration()
         else:
             declaration = self.parse_interface_method_or_field_declaration()
 
         declaration._position = token.position
 
         return declaration
+
+    def parse_aidl_const_declaration(self):
+        modifiers, annotations = self.parse_variable_modifiers()
+
+        java_type = self.parse_type()
+        name = self.parse_identifier()
+
+        array_dimension = self.parse_array_dimension()
+        self.accept('=')
+        initializer = self.parse_variable_initializer()
+
+        declarators = [
+            tree.VariableDeclarator(
+                name=name,
+                dimensions=array_dimension,
+                initializer=initializer,
+            )
+        ]
+
+        while self.try_accept(','):
+            declarators.append(self.parse_constant_declarator())
+
+        self.accept(';')
+
+        decl = tree.ConstantDeclaration(declarators=declarators)
+        decl.type = java_type
+        decl.modifiers = modifiers
+        decl.annotations = annotations
+
+        if decl.modifiers is None:
+            decl.modifiers = set()
+        decl.modifiers.add("const")
+
+        return decl
 
     @parse_debug
     def parse_interface_method_or_field_declaration(self):
@@ -2355,6 +2473,7 @@ class Parser(object):
         constant_name = None
         arguments = None
         body = None
+        value = None
 
         next_token = self.tokens.look()
         if next_token:
@@ -2365,17 +2484,25 @@ class Parser(object):
 
         constant_name = self.parse_identifier()
 
-        if self.would_accept('('):
+        if self.try_accept('='):
+            value = self.parse_expression()
+        elif self.would_accept('('):
             arguments = self.parse_arguments()
 
         if self.would_accept('{'):
             body = self.parse_class_body()
 
-        return tree.EnumConstantDeclaration(annotations=annotations,
-                                            name=constant_name,
-                                            arguments=arguments,
-                                            body=body,
-                                            documentation=javadoc)
+        enum_const = tree.EnumConstantDeclaration(
+            annotations=annotations,
+            name=constant_name,
+            arguments=arguments,
+            body=body,
+            documentation=javadoc,
+        )
+
+        # if your AST supports it
+        enum_const.value = value
+        return enum_const
 
     @parse_debug
     def parse_annotation_type_body(self):
